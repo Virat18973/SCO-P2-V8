@@ -1,4 +1,4 @@
-#@title 2. Run Sinter Burden Optimizer v31.9 — scenario constraint fix
+#@title 2. Run Sinter Burden Optimizer v31.9
 
 # ============================================================================
 # SINTER BURDEN OPTIMIZER v31.9
@@ -66,6 +66,21 @@ FE_TOLERANCE = 0.3
 FE_LOWER = FE_TARGET - FE_TOLERANCE
 FE_UPPER = FE_TARGET + FE_TOLERANCE
 FE_CENTER_WEIGHT = 2.0
+
+# Dashboard quality targets — single source of truth for app.py.
+# These match the v31.9 plant limits used by the optimizer.
+TARGETS = {
+    "SiO2_max": 5.80,
+    "Al2O3_max": 4.50,
+    "Al2O3_SiO2_max": 0.98,
+    "Basicity_min": 1.90,
+    "Basicity_max": 2.00,
+    "MgO_min": 2.20,
+    "MgO_max": 2.40,
+    "CaO_min": 10.50,
+    "CaO_max": 11.50,
+}
+
 
 # --- QUALITY DEVIATION WEIGHTS (diagnostic only) ---
 DEVIATION_WEIGHTS = {
@@ -485,11 +500,10 @@ def add_structural_constraints(prob, x, df, bounds, iron_ores, fluxes, iron_ore_
 
     if "MILL_SCALE" in x:
         if "MILL_SCALE" in unavailable_iron:
-            # MILL_SCALE is already forced to zero by the generic
-            # iron-ore availability constraint above. Do NOT add another
-            # constraint with the same name; this used to break shortage
-            # scenarios with PuLP's "overlapping constraint names" error.
-            pass
+            # MILL_SCALE is also part of the generic iron-ore availability
+            # loop above. Do not add the same PuLP constraint name twice.
+            if "MILL_SCALE_unavailable" not in prob.constraints:
+                prob += x["MILL_SCALE"] == 0, "MILL_SCALE_unavailable"
         else:
             # When available, Mill Scale MUST be 5–15% of total burden.
             prob += x["MILL_SCALE"] >= MILL_SCALE_MIN_BURDEN_PCT * total_burden, "MILL_SCALE_Burden_Min"
@@ -981,11 +995,14 @@ def solve_blend_with_compensation(df, production_tonnes, targets, baseline_blend
 
     if mandate_reasons:
         diagnostics = [
-            "⚠️ MANDATE AVAILABILITY ISSUE — production-continuity mode is active.",
+            "🚫 INFEASIBLE — strict burden mandates cannot be satisfied.",
             *[f"   {r}" for r in mandate_reasons],
-            "   Normal production optimization will keep IOL=8% and BF=17% whenever those materials are available.",
-            "   If a mandated material is unavailable, recovery mode may flag a mandate exception rather than stopping production."
+            "   IOL Fines must equal exactly 8% of total charged burden.",
+            "   BF Returns must equal exactly 17% of total charged burden.",
+            "   Total charged burden includes COKE_BREEZE.",
+            "   Enable/restore the unavailable mandated material and run the optimizer again."
         ]
+        return "Infeasible", None, None, None, diagnostics, False
     else:
         diagnostics = []
 
@@ -2473,18 +2490,48 @@ def quality_table(achieved, targets=None):
 
 
 def what_if_analysis(df, targets=None):
+    """Run one-material-at-a-time shortage scenarios.
+
+    A shortage is simulated by setting Available_Tonnes to zero. The normal
+    optimizer is then called unchanged, so all chemistry, technical, fuel,
+    availability and strict IOL/BF constraints remain active.
+
+    IOL Fines and BF Returns are deliberately reported as infeasible when
+    removed because their 8% and 17% total-burden mandates cannot be met.
+    """
     targets = targets or TARGETS
     rows = []
+
     for material in df.index:
         scenario = df.copy()
         scenario.loc[material, "Available_Tonnes"] = 0.0
-        res = solve_blend_with_compensation(scenario, 1000, targets, baseline_blend=None)
-        status, blend, cost, achieved = res[0], res[1], res[2], res[3]
+
+        try:
+            res = solve_blend_with_compensation(
+                scenario, 1000, targets, baseline_blend=None
+            )
+            status, blend, cost, achieved = res[0], res[1], res[2], res[3]
+            diagnostics = res[4] if len(res) > 4 else []
+        except Exception as exc:
+            status, blend, cost, achieved = "Error", None, None, None
+            diagnostics = [f"{type(exc).__name__}: {exc}"]
+
+        # Give the two mandatory materials an explicit scenario status.
+        if material == "IOL_Fines":
+            status = "Infeasible — IOL 8% mandate"
+        elif material == "BF_Returns":
+            status = "Infeasible — BF 17% mandate"
+
         rows.append({
             "Missing Material": material,
+            "Group": str(scenario.loc[material, "Group"]),
             "Status": status,
-            "Cost ₹/t": cost,
+            "Cost ₹/t": float(cost) if cost is not None else np.nan,
             "Fe %": achieved.get("Fe") if achieved else np.nan,
             "SiO2 %": achieved.get("SiO2") if achieved else np.nan,
+            "Al2O3 %": achieved.get("Al2O3") if achieved else np.nan,
+            "Basicity": achieved.get("Basicity") if achieved else np.nan,
+            "Diagnostics": " | ".join(diagnostics) if diagnostics else "",
         })
+
     return pd.DataFrame(rows)
